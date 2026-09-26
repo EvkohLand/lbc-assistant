@@ -50,6 +50,25 @@ button, input, select, textarea { font: inherit; color: inherit; }
 }
 .icon-btn:active { background: var(--bg); }
 
+.top-actions { display: flex; align-items: center; gap: 4px; }
+.cost-pill {
+  min-height: 36px; padding: 6px 12px; border-radius: 20px; border: 1.5px solid var(--line); background: #fff;
+  font-weight: 700; font-size: 14px; color: var(--ink-2); cursor: pointer; font-variant-numeric: tabular-nums;
+}
+.cost-pill:active { background: var(--bg); }
+.ops { width: 100%; border-collapse: collapse; font-size: 14px; }
+.ops th { text-align: left; font-weight: 600; color: var(--ink-3); font-size: 12px; padding: 0 8px 6px 0; }
+.ops td { padding: 8px 8px 8px 0; border-top: 1px solid var(--line); vertical-align: top; }
+.ops td.num, .ops th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ops .model { display: block; color: var(--ink-3); font-size: 12px; overflow-wrap: anywhere; }
+.ops td:first-child { min-width: 9.5em; }
+.ops tfoot td { font-weight: 700; border-top: 2px solid var(--ink-3); }
+.table-wrap { overflow-x: auto; margin: 0 -4px; padding: 0 4px; }
+.kpis { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 14px; }
+.kpis div { background: var(--bg); border-radius: 12px; padding: 10px; text-align: center; }
+.kpis strong { display: block; font-size: 18px; font-variant-numeric: tabular-nums; }
+.kpis span { font-size: 12px; color: var(--ink-3); }
+
 /* ---------- Étapes ---------- */
 .stepper { background: #fff; border-bottom: 1px solid var(--line); padding: 10px 12px; }
 .stepper ol { list-style: none; margin: 0 auto; padding: 0; display: flex; gap: 6px; max-width: 720px; }

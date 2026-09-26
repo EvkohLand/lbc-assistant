@@ -18,6 +18,15 @@
         { id: 'openai/gpt-5.6-sol', label: 'GPT-5.6 Sol' },
       ],
     },
+    research: {
+      label: 'Recherche sur Internet', storage: 'lbc-assistant.model.research', default: 'deepseek/deepseek-v4.1-flash',
+      hint: "Cherche la fiche produit, le prix neuf et les prix d'occasion. Doit accepter les outils.",
+      models: [
+        { id: 'deepseek/deepseek-v4.1-flash', label: 'DeepSeek V4.1 Flash (très économique)' },
+        { id: 'google/gemini-3.8-flash', label: 'Gemini 3.8 Flash (recherche Google intégrée)' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5 (plus cher)' },
+      ],
+    },
     text: {
       label: "Rédaction de l'annonce", storage: 'lbc-assistant.model.text', default: 'deepseek/deepseek-v4.1-flash',
       hint: 'Rédige titre et description.',
@@ -79,6 +88,9 @@
       ad: null,
       error: '',
       tab: 'apercu',
+      ops: [], // opérations d'IA de cette annonce
+      research: { status: 'idle', data: null, sources: [], error: '' },
+      phase: '',
       enhance: { busy: false, url: '', error: '' },
     };
   }
@@ -89,6 +101,10 @@
     del(k) { try { localStorage.removeItem(k); } catch (e) { /* stockage indisponible */ } },
   };
   const apiKey = () => store.get(STORAGE_KEY) || '';
+  const STORAGE_WEB = 'lbc-assistant.webSearch';
+  const webEnabled = () => store.get(STORAGE_WEB) !== 'off';
+  const STORAGE_COVER = 'lbc-assistant.autoCover';
+  const autoCover = () => store.get(STORAGE_COVER) !== 'off';
   const model = (role) => store.get(ROLES[role].storage) || ROLES[role].default;
 
   // ---------- Utilitaires ----------
@@ -196,45 +212,266 @@
     return res.json();
   }
 
-  async function chat(role, messages, { temperature = 0.4, maxTokens = 2500 } = {}) {
+  // Envoie une requête, retente une fois si `fallback` sait corriger le corps refusé,
+  // et consigne l'opération (jetons, coût, durée) dans state.ops.
+  async function request(label, body, ...fallbacks) {
+    const t0 = performance.now();
+    let res = await post(body);
+    let current = body;
+    for (const fallback of fallbacks) {
+      if (res.ok || ![400, 404, 422].includes(res.status)) break;
+      const txt = await res.clone().text();
+      const next = fallback(current, txt);
+      if (next) { current = next; res = await post(next); }
+    }
+    let data;
+    try {
+      data = await readResponse(res);
+    } catch (e) {
+      recordOp(label, body.model, null, performance.now() - t0, e.message);
+      throw e;
+    }
+    recordOp(label, body.model, data, performance.now() - t0);
+    return data;
+  }
+
+  const messageText = (data) => {
+    let content = data.choices?.[0]?.message?.content;
+    if (Array.isArray(content)) content = content.map((c) => c.text || '').join('');
+    return content || '';
+  };
+
+  async function chat(label, role, messages, { temperature = 0.4, maxTokens = 2500 } = {}) {
     const body = {
       model: model(role), messages, temperature, max_tokens: maxTokens,
       response_format: { type: 'json_object' },
       // N'envoie la requête qu'aux fournisseurs qui respectent le format JSON.
       provider: { require_parameters: true },
     };
-    let res = await post(body);
     // Aucun fournisseur ne respecte le format JSON imposé : on retente sans.
-    if (res.status === 400 || res.status === 404) {
-      const txt = await res.clone().text();
-      if (/response_format|json|provider|endpoint/i.test(txt)) { delete body.response_format; delete body.provider; res = await post(body); }
-    }
-    const data = await readResponse(res);
-    let content = data.choices?.[0]?.message?.content;
-    if (Array.isArray(content)) content = content.map((c) => c.text || '').join('');
-    return parseJson(content || '');
+    const data = await request(label, body, (b, txt) => {
+      if (!/response_format|json|provider|endpoint/i.test(txt)) return null;
+      const { response_format, provider, ...rest } = b;
+      return rest;
+    });
+    return parseJson(messageText(data));
+  }
+
+  // Recherche web exécutée par OpenRouter pendant l'appel : le modèle décide des requêtes.
+  async function webResearch(label, messages) {
+    const body = {
+      model: model('research'), messages, temperature: 0.2, max_tokens: 3500,
+      tools: [{ type: 'openrouter:web_search', parameters: { max_results: 5, max_total_results: 15 } }],
+    };
+    // Outil serveur refusé pour ce modèle : ancienne méthode, une recherche unique.
+    const data = await request(label, body, (b, txt) => {
+      if (!/tool|web_search|plugin/i.test(txt)) return null;
+      const { tools, ...rest } = b;
+      return { ...rest, plugins: [{ id: 'web', max_results: 8 }] };
+    });
+    const msg = data.choices?.[0]?.message || {};
+    const cited = (msg.annotations || []).filter((a) => a.type === 'url_citation')
+      .map((a) => ({ titre: a.url_citation?.title || '', url: a.url_citation?.url || '' }));
+    return { json: parseJson(messageText(data)), cited };
   }
 
   // Produit une image à partir d'une photo et d'une consigne. Renvoie une URL data:.
-  async function generateImage(photoData, prompt) {
+  async function generateImage(label, photoData, prompt) {
     const body = {
       model: model('image'),
       modalities: ['image'],
       messages: [{ role: 'user', content: [{ type: 'text', text: prompt }, { type: 'image_url', image_url: { url: photoData } }] }],
       image_config: { aspect_ratio: '4:3' },
     };
-    let res = await post(body);
-    if (res.status === 400) {
-      // Réglage d'image refusé par ce modèle : on retente avec ses valeurs par défaut.
-      delete body.image_config;
-      res = await post(body);
+    const data = await request(label, body,
+      // Réglage d'image refusé : valeurs par défaut du modèle.
+      (b) => { const { image_config, ...rest } = b; return rest; },
+      // Sortie image seule refusée : image et texte.
+      (b) => ({ ...b, modalities: ['image', 'text'] }));
+    const url = extractImage(data.choices?.[0]?.message || {});
+    if (!url) {
+      const text = messageText(data).slice(0, 160);
+      throw new ApiError(`Le modèle n'a pas renvoyé d'image${text ? ' (réponse : « ' + text + ' »)' : ''}. Réessayez ou changez de modèle d'image dans les réglages.`);
     }
-    const data = await readResponse(res);
-    const msg = data.choices?.[0]?.message || {};
-    let url = msg.images?.[0]?.image_url?.url;
-    if (!url && Array.isArray(msg.content)) url = msg.content.find((c) => c.type === 'image_url')?.image_url?.url;
-    if (!url) throw new ApiError("Le modèle n'a pas renvoyé d'image. Réessayez ou changez de modèle d'image dans les réglages.");
-    return url;
+    return toLocalImage(url);
+  }
+
+  // L'image peut arriver sous plusieurs formes selon le fournisseur.
+  function extractImage(msg) {
+    const found = [];
+    const b64 = (x) => (x ? 'data:image/png;base64,' + x : null);
+    for (const im of msg.images || []) {
+      found.push(typeof im === 'string' ? im : null, im?.image_url?.url, typeof im?.image_url === 'string' ? im.image_url : null, im?.url, b64(im?.b64_json));
+    }
+    if (Array.isArray(msg.content)) {
+      for (const c of msg.content) {
+        found.push(c?.image_url?.url, typeof c?.image_url === 'string' ? c.image_url : null, c?.url, b64(c?.b64_json), b64(c?.image_base64), b64(c?.result));
+      }
+    } else if (typeof msg.content === 'string') {
+      found.push(msg.content.match(/data:image\/[a-z+]+;base64,[A-Za-z0-9+/=]+/)?.[0]);
+      found.push(msg.content.match(/https?:\/\/[^\s)"']+\.(?:png|jpe?g|webp)(?:\?[^\s)"']*)?/i)?.[0]);
+    }
+    return found.find((x) => typeof x === 'string' && /^(data:image\/|https?:\/\/)/.test(x)) || '';
+  }
+
+  // Une image distante est rapatriée pour pouvoir être réencodée dans le ZIP.
+  async function toLocalImage(url) {
+    if (url.startsWith('data:')) return url;
+    try {
+      const blob = await (await fetch(url)).blob();
+      return URL.createObjectURL(blob);
+    } catch (e) {
+      return url;
+    }
+  }
+
+  // ---------- Coûts ----------
+  // Prix par fournisseur, lus sur OpenRouter. Clé : identifiant du modèle.
+  const pricingCache = {};
+  function fetchPricing(id) {
+    if (!pricingCache[id]) {
+      pricingCache[id] = fetch(`${OPENROUTER}/models/${id}/endpoints`)
+        .then((r) => (r.ok ? r.json() : null))
+        .then((j) => (j?.data?.endpoints || []).map((e) => ({
+          provider: e.provider_name,
+          prompt: Number(e.pricing?.prompt) || 0,
+          completion: Number(e.pricing?.completion) || 0,
+          imageOutput: Number(e.pricing?.image_output) || 0,
+          webSearch: Number(e.pricing?.web_search) || 0,
+          request: Number(e.pricing?.request) || 0,
+        })))
+        .catch(() => []);
+    }
+    return pricingCache[id];
+  }
+  // Fourchette de prix entre fournisseurs, en dollars par million de jetons.
+  async function priceRange(id) {
+    const eps = (await fetchPricing(id)).filter((e) => e.prompt || e.completion || e.imageOutput);
+    if (!eps.length) return null;
+    const range = (k) => { const v = eps.map((e) => e[k]).filter((x) => x > 0); return v.length ? [Math.min(...v) * 1e6, Math.max(...v) * 1e6] : null; };
+    return { prompt: range('prompt'), completion: range('completion'), imageOutput: range('imageOutput'), webSearch: range('webSearch') };
+  }
+
+  function recordOp(label, requested, data, ms, error) {
+    const u = data?.usage || {};
+    const op = {
+      label,
+      model: data?.model || requested,
+      provider: data?.provider || '',
+      prompt: u.prompt_tokens || 0,
+      completion: u.completion_tokens || 0,
+      reasoning: u.completion_tokens_details?.reasoning_tokens || 0,
+      cached: u.prompt_tokens_details?.cached_tokens || 0,
+      searches: u.server_tool_use_details?.tool_calls_executed || 0,
+      cost: typeof u.cost === 'number' ? u.cost : null,
+      estimated: false,
+      ms: Math.round(ms),
+      error: error || '',
+    };
+    state.ops.push(op);
+    if (op.cost === null && !error) estimateCost(op);
+    refreshCost();
+  }
+
+  // Sans coût renvoyé par OpenRouter, on le calcule avec le tarif du fournisseur utilisé.
+  async function estimateCost(op) {
+    const eps = await fetchPricing(op.model);
+    const ep = eps.find((e) => e.provider === op.provider) || eps[0];
+    if (!ep) return;
+    const perOut = ep.imageOutput || ep.completion;
+    op.cost = op.prompt * ep.prompt + op.completion * perOut + op.searches * ep.webSearch + ep.request;
+    op.estimated = true;
+    refreshCost();
+  }
+
+  function costTotals(ops = state.ops) {
+    return ops.reduce((t, o) => ({
+      cost: t.cost + (o.cost || 0),
+      prompt: t.prompt + o.prompt,
+      completion: t.completion + o.completion,
+      searches: t.searches + o.searches,
+      estimated: t.estimated || o.estimated,
+      unknown: t.unknown || (o.cost === null && !o.error),
+    }), { cost: 0, prompt: 0, completion: 0, searches: 0, estimated: false, unknown: false });
+  }
+
+  function fmtUsd(v) {
+    if (v === null || v === undefined) return '?';
+    if (v === 0) return '0 $';
+    const opts = v < 0.01 ? { maximumSignificantDigits: 2 } : { minimumFractionDigits: 2, maximumFractionDigits: v < 1 ? 4 : 2 };
+    return v.toLocaleString('fr-FR', opts) + ' $';
+  }
+  const fmtInt = (n) => n.toLocaleString('fr-FR');
+  const fmtPerM = (r) => (r ? (r[0] === r[1] ? fmtUsd(r[0]) : `${fmtUsd(r[0]).replace(' $', '')} à ${fmtUsd(r[1])}`) : '');
+
+  function costDetailHtml() {
+    const t = costTotals();
+    const rows = state.ops.map((o) => `<tr>
+      <td>${esc(o.label)}${o.error ? ' <span class="chip warn">échec</span>' : ''}
+        <span class="model" title="${esc(o.model)}">${esc(o.model.split('/').pop())}${o.provider ? ' via ' + esc(o.provider) : ''}${o.searches ? `, ${o.searches} recherche${o.searches > 1 ? 's' : ''} web` : ''}, ${(o.ms / 1000).toLocaleString('fr-FR', { maximumFractionDigits: 1 })} s</span></td>
+      <td class="num">${fmtInt(o.prompt)}</td>
+      <td class="num">${fmtInt(o.completion)}${o.reasoning ? `<span class="model">dont ${fmtInt(o.reasoning)} réflexion</span>` : ''}</td>
+      <td class="num">${o.estimated ? '≈ ' : ''}${fmtUsd(o.cost)}</td></tr>`).join('');
+    return `
+      <div class="kpis">
+        <div><strong>${t.estimated ? '≈ ' : ''}${fmtUsd(t.cost)}</strong><span>coût total</span></div>
+        <div><strong>${fmtInt(t.prompt + t.completion)}</strong><span>jetons</span></div>
+        <div><strong>${state.ops.length}</strong><span>appel${state.ops.length > 1 ? 's' : ''} d'IA</span></div>
+      </div>
+      <div class="table-wrap"><table class="ops">
+        <thead><tr><th>Opération</th><th class="num">Entrée</th><th class="num">Sortie</th><th class="num">Coût</th></tr></thead>
+        <tbody>${rows}</tbody>
+        <tfoot><tr><td>Total${t.searches ? `, ${t.searches} recherche${t.searches > 1 ? 's' : ''} web` : ''}</td><td class="num">${fmtInt(t.prompt)}</td><td class="num">${fmtInt(t.completion)}</td><td class="num">${t.estimated ? '≈ ' : ''}${fmtUsd(t.cost)}</td></tr></tfoot>
+      </table></div>
+      <p class="muted small" style="margin:10px 0 0">Coût facturé par OpenRouter, renvoyé avec chaque réponse, en dollars (monnaie de facturation d'OpenRouter). Entrée et sortie en jetons${t.estimated ? '. « ≈ » : coût non renvoyé, calculé avec le tarif du fournisseur' : ''}.</p>`;
+  }
+
+  async function modelPricesHtml() {
+    const ids = [...new Set(Object.keys(ROLES).map((r) => model(r)))];
+    const rows = await Promise.all(Object.keys(ROLES).map(async (role) => {
+      const pr = await priceRange(model(role));
+      if (!pr) return `<tr><td>${ROLES[role].label}<span class="model">${esc(model(role))}</span></td><td class="num" colspan="2">prix indisponible</td></tr>`;
+      const out = pr.imageOutput ? `${fmtPerM(pr.imageOutput)} (image)` : fmtPerM(pr.completion);
+      return `<tr><td>${ROLES[role].label}<span class="model">${esc(model(role))}</span></td><td class="num">${fmtPerM(pr.prompt) || '-'}</td><td class="num">${out || '-'}</td></tr>`;
+    }));
+    return `<div class="table-wrap"><table class="ops">
+      <thead><tr><th>Modèle</th><th class="num">Entrée / M</th><th class="num">Sortie / M</th></tr></thead>
+      <tbody>${rows.join('')}</tbody></table></div>
+      <p class="muted small" style="margin:10px 0 0">Prix pour un million de jetons. Une fourchette signifie que le prix varie selon le fournisseur choisi par OpenRouter. ${ids.length} modèle${ids.length > 1 ? 's' : ''} distinct${ids.length > 1 ? 's' : ''}.</p>`;
+  }
+
+  function openCostSheet() {
+    openSheet(`
+      <h2 id="sheet-title">Coût de cette annonce</h2>
+      <div id="cost-sheet">${costDetailHtml()}</div>
+      <h2 style="margin-top:22px">Prix des modèles</h2>
+      <div id="model-prices"><p class="muted">Chargement des prix...</p></div>
+      <button class="btn block" id="btn-close-cost" style="margin-top:16px">Fermer</button>`, (sh) => {
+      $('#btn-close-cost', sh).onclick = closeSheet;
+      modelPricesHtml().then((html) => { const el = $('#model-prices'); if (el) el.innerHTML = html; });
+    });
+  }
+
+  function costsCsv() {
+    const q = (v) => `"${String(v).replace(/"/g, '""')}"`;
+    const lines = [['operation', 'modele', 'fournisseur', 'jetons_entree', 'jetons_sortie', 'jetons_reflexion', 'recherches_web', 'cout_usd', 'estime', 'duree_ms', 'erreur'].join(',')];
+    for (const o of state.ops) {
+      lines.push([q(o.label), q(o.model), q(o.provider), o.prompt, o.completion, o.reasoning, o.searches, o.cost ?? '', o.estimated ? 'oui' : 'non', o.ms, q(o.error)].join(','));
+    }
+    const t = costTotals();
+    lines.push([q('TOTAL'), '', '', t.prompt, t.completion, '', t.searches, t.cost.toFixed(6), t.estimated ? 'oui' : 'non', '', ''].join(','));
+    return lines.join('\n');
+  }
+
+  function refreshCost() {
+    const pill = $('#btn-cost');
+    const t = costTotals();
+    pill.hidden = !state.ops.length;
+    pill.textContent = (t.estimated ? '≈ ' : '') + fmtUsd(t.cost);
+    const live = $('#live-cost');
+    if (live) live.textContent = fmtUsd(t.cost);
+    if (!$('#sheet').hidden && $('#cost-sheet')) $('#cost-sheet').innerHTML = costDetailHtml();
+    if ($('#cost-card-body')) $('#cost-card-body').innerHTML = costDetailHtml();
   }
 
   function post(b) {
@@ -307,12 +544,14 @@ Réponds uniquement avec un objet JSON de cette forme :
 La fourchette de prix correspond au prix de revente réaliste d'occasion en France, en euros.`;
 
   async function runAnalysis() {
-    state.step = 'analyzing'; state.error = ''; render();
+    state.step = 'analyzing'; state.phase = 'vision'; state.error = '';
+    state.research = { status: 'idle', data: null, sources: [], error: '' };
+    render();
     try {
       const userText = state.hint.trim()
         ? `Précision du vendeur : ${state.hint.trim()}`
         : "Le vendeur n'a pas donné de précision.";
-      const res = await chat('vision', [
+      const res = await chat('Analyse des photos', 'vision', [
         { role: 'system', content: ANALYSIS_PROMPT },
         { role: 'user', content: [{ type: 'text', text: userText }, ...imageParts(state.photos, MAX_PHOTOS)] },
       ], { temperature: 0.2 });
@@ -320,15 +559,113 @@ La fourchette de prix correspond au prix de revente réaliste d'occasion en Fran
       for (const k of Object.keys(state.facts)) state.facts[k] = state.analysis[k] || '';
       state.answers = {};
       if (!state.details.etat && etatById(state.analysis.etat_estime)) state.details.etat = state.analysis.etat_estime;
-      if (!state.details.prix && state.analysis.fourchette_prix.max > 0) {
-        const { min, max } = state.analysis.fourchette_prix;
-        state.details.prix = String(Math.round((min + max) / 2));
-      }
-      state.step = 'questions';
     } catch (e) {
       handleError(e, 'photos');
+      render();
+      return;
     }
+    if (webEnabled()) {
+      state.phase = 'web';
+      render();
+      await runResearch();
+      if (state.step === 'key') { render(); return; }
+    }
+    suggestPrice();
+    state.step = 'questions';
     render();
+  }
+
+  // Prix proposé par défaut : milieu de la fourchette, web en priorité sur l'estimation photo.
+  function suggestPrice() {
+    if (state.details.prix) return;
+    const { min, max } = priceBand();
+    if (max > 0) state.details.prix = String(Math.round((min + max) / 2));
+  }
+  function priceBand() {
+    const w = state.research.data?.prix_occasion;
+    if (w && w.max > 0) return { min: w.min || w.max, max: w.max, web: true };
+    return { ...(state.analysis?.fourchette_prix || { min: 0, max: 0 }), web: false };
+  }
+
+  const RESEARCH_PROMPT = `Tu es un assistant de recherche pour un particulier qui revend un objet d'occasion sur Leboncoin, en France.
+On te donne ce qu'une première analyse a lu sur les photos. Utilise la recherche web, en plusieurs requêtes ciblées, pour réunir :
+1. la fiche produit officielle : nom commercial exact, année de sortie, caractéristiques techniques, contenu de la boîte d'origine ;
+2. le prix neuf (prix de lancement ou prix actuel en magasin) ;
+3. les prix d'occasion réellement pratiqués en France (Leboncoin, eBay, Rakuten, Vinted, Back Market selon l'objet) ;
+4. les qualités reconnues dans les tests et avis ;
+5. comment on se sert de l'objet, ses compatibilités ;
+6. les mots que les acheteurs tapent pour le chercher.
+N'invente rien : toute information doit venir d'une page trouvée. Si les résultats montrent que l'identification est fausse ou douteuse, dis-le.
+Réponds uniquement avec un objet JSON de cette forme :
+{
+  "identification_confirmee": true,
+  "remarque_identification": "",
+  "nom_complet": "",
+  "marque": "",
+  "modele": "",
+  "annee_sortie": "",
+  "prix_neuf": { "montant": 0, "precision": "prix de lancement 2023, ou prix actuel chez tel magasin" },
+  "prix_occasion": { "min": 0, "max": 0, "commentaire": "" },
+  "caracteristiques_officielles": [""],
+  "contenu_boite_origine": [""],
+  "qualites_reconnues": [""],
+  "utilisation": "2 ou 3 phrases concrètes",
+  "compatibilites": [""],
+  "mots_cles_acheteurs": [""],
+  "sources": [{ "titre": "", "url": "" }]
+}`;
+
+  async function runResearch() {
+    state.research = { status: 'running', data: null, sources: [], error: '' };
+    try {
+      const a = state.analysis;
+      const known = {
+        objet: state.facts.objet, marque: state.facts.marque, modele: state.facts.modele,
+        couleur: state.facts.couleur, dimensions: state.facts.dimensions,
+        details_lus_sur_photos: a.caracteristiques, precision_du_vendeur: state.hint.trim(),
+      };
+      const { json, cited } = await webResearch('Recherche sur Internet', [
+        { role: 'system', content: RESEARCH_PROMPT },
+        { role: 'user', content: 'Objet à documenter (JSON) :\n' + JSON.stringify(known, null, 2) },
+      ]);
+      const data = normalizeResearch(json);
+      const seen = new Set();
+      const sources = [...data.sources, ...cited].filter((x) => /^https?:\/\//.test(x.url) && !seen.has(x.url) && seen.add(x.url)).slice(0, 12);
+      if (!state.facts.marque && data.marque) state.facts.marque = data.marque;
+      if (!state.facts.modele && data.modele) state.facts.modele = data.modele;
+      state.research = { status: 'done', data, sources, error: '' };
+    } catch (e) {
+      console.error(e);
+      if (e instanceof ApiError && e.status === 401) { handleError(e, 'photos'); return; }
+      state.research = {
+        status: 'error', data: null, sources: [],
+        error: e instanceof TypeError ? 'Connexion impossible.' : e.message,
+      };
+    }
+  }
+
+  function normalizeResearch(r) {
+    const arr = (v) => (Array.isArray(v) ? v.filter((x) => x && String(x).trim()).map((x) => humanize(String(x))) : []);
+    const num = (v) => { const n = Number(v); return isFinite(n) && n > 0 ? Math.round(n) : 0; };
+    const po = r.prix_occasion || {};
+    const min = num(po.min); const max = num(po.max);
+    return {
+      identification_confirmee: r.identification_confirmee !== false,
+      remarque_identification: humanize(r.remarque_identification || ''),
+      nom_complet: humanize(r.nom_complet || ''),
+      marque: humanize(r.marque || ''),
+      modele: humanize(r.modele || ''),
+      annee_sortie: String(r.annee_sortie || '').trim(),
+      prix_neuf: { montant: num(r.prix_neuf?.montant), precision: humanize(r.prix_neuf?.precision || '') },
+      prix_occasion: { min: Math.min(min || max, max || min), max: Math.max(min, max), commentaire: humanize(po.commentaire || '') },
+      caracteristiques_officielles: arr(r.caracteristiques_officielles).slice(0, 12),
+      contenu_boite_origine: arr(r.contenu_boite_origine).slice(0, 10),
+      qualites_reconnues: arr(r.qualites_reconnues).slice(0, 6),
+      utilisation: humanize(r.utilisation || ''),
+      compatibilites: arr(r.compatibilites).slice(0, 8),
+      mots_cles_acheteurs: arr(r.mots_cles_acheteurs).slice(0, 10),
+      sources: (Array.isArray(r.sources) ? r.sources : []).map((x) => ({ titre: String(x?.titre || ''), url: String(x?.url || '') })),
+    };
   }
 
   function normalizeAnalysis(r) {
@@ -367,6 +704,8 @@ STYLE, règles strictes :
 - Vouvoiement.
 - N'invente rien. Une info absente des données ne doit pas être affirmée.
 
+INFORMATIONS_INTERNET (si présentes) : fiche trouvée en ligne. Sers-t'en pour donner le nom commercial exact, des caractéristiques officielles précises, le contenu d'origine et expliquer l'utilisation. Mentionne le prix neuf s'il est connu (par exemple "vendu 399 euros neuf"), c'est un argument fort. Glisse les mots-clés acheteurs dans le titre et la description quand ils sont pertinents. Les photos et les réponses du vendeur priment toujours sur Internet : un accessoire de la boîte d'origine n'est inclus que si le vendeur ou les photos le confirment. Ne copie aucune phrase d'un site et ne cite aucun site.
+
 TITRE, référencement Leboncoin :
 - Entre 35 et 70 caractères, jamais plus de 100.
 - Commence par le mot que l'acheteur tape dans la barre de recherche (le type d'objet), puis la marque, le modèle ou la référence, puis 1 ou 2 attributs décisifs (taille, capacité, couleur, pointure, puissance, âge).
@@ -397,6 +736,7 @@ Réponds uniquement avec un objet JSON de cette forme :
 
   async function runWriting() {
     state.step = 'generating'; state.error = ''; render();
+    if (autoCover() && !state.photos.some((p) => p.generated) && !state.enhance.busy) runEnhance(true);
     try {
       const etat = etatById(state.details.etat);
       const a = state.analysis || {};
@@ -419,8 +759,9 @@ Réponds uniquement avec un objet JSON de cette forme :
         ville: state.details.mainPropre ? state.details.ville.trim() : '',
         envoi_possible: state.details.envoi,
         infos_libres_du_vendeur: state.details.notes.trim(),
+        INFORMATIONS_INTERNET: state.research.data ? (({ sources, ...rest }) => rest)(state.research.data) : null,
       };
-      const res = await chat('text', [
+      const res = await chat(state.ad ? "Réécriture de l'annonce" : "Rédaction de l'annonce", 'text', [
         { role: 'system', content: WRITING_PROMPT },
         {
           role: 'user',
@@ -467,21 +808,34 @@ Keep the exact same item: same shape, proportions, colors, brand markings, and a
 Do not add text, logos, watermarks, props, hands or people.
 Center the item on a plain light neutral background, soft even studio lighting, subtle natural shadow, sharp focus, photorealistic.`;
 
-  async function runEnhance() {
+  // auto : lancée avec la rédaction, l'image passe directement en couverture.
+  async function runEnhance(auto = false) {
     const source = state.photos.find((p) => !p.generated && p.apiData);
-    if (!source) return;
+    if (!source || state.enhance.busy) return;
     state.enhance = { busy: true, url: '', error: '' };
     render();
     try {
       const objet = [state.facts.objet, state.facts.marque, state.facts.modele].filter(Boolean).join(' ');
-      state.enhance.url = await generateImage(source.apiData, ENHANCE_PROMPT(objet));
+      const url = await generateImage('Photo de couverture', source.apiData, ENHANCE_PROMPT(objet));
+      if (auto) {
+        useAsCover(url);
+        toast('Photo de couverture créée');
+      } else {
+        state.enhance.url = url;
+      }
     } catch (e) {
       console.error(e);
       if (e instanceof ApiError && e.status === 401) { handleError(e, 'annonce'); state.enhance.busy = false; render(); return; }
-      state.enhance.error = e instanceof TypeError ? 'Connexion à OpenRouter impossible.' : e.message;
+      state.enhance.error = 'La photo de couverture n\'a pas pu être créée : ' + (e instanceof TypeError ? 'connexion à OpenRouter impossible.' : e.message);
     }
     state.enhance.busy = false;
     render();
+  }
+
+  function useAsCover(url) {
+    state.photos.filter((p) => p.generated && p.url.startsWith('blob:')).forEach((p) => URL.revokeObjectURL(p.url));
+    state.photos = state.photos.filter((p) => !p.generated);
+    state.photos.unshift({ id: uid(), url, apiData: '', generated: true });
   }
 
   function enhanceCard() {
@@ -542,6 +896,7 @@ Center the item on a plain light neutral background, soft even studio lighting, 
       'REMISE EN MAIN PROPRE', d.mainPropre ? 'Oui' + (d.ville.trim() ? ' (' + d.ville.trim() + ')' : '') : 'Non', '',
       'ENVOI', d.envoi ? 'Oui' : 'Non', '',
       'DESCRIPTION', state.ad.description, '',
+      'COÛT DE GÉNÉRATION', `${fmtUsd(costTotals().cost)} pour ${state.ops.length} appel(s) d'IA, détail dans couts.csv`, '',
     ];
     return lines.join('\n');
   }
@@ -593,6 +948,8 @@ Center the item on a plain light neutral background, soft even studio lighting, 
         zip.file('titre.txt', state.ad.titre);
         zip.file('description.txt', state.ad.description);
         zip.file('apercu.html', html);
+        zip.file('couts.csv', costsCsv());
+        if (state.research.sources.length) zip.file('sources.txt', state.research.sources.map((x) => `${x.titre || hostOf(x.url)}\n${x.url}`).join('\n\n'));
         const folder = zip.folder('photos');
         photos.forEach((p) => folder.file(p.name, p.blob));
         const blob = await zip.generateAsync({ type: 'blob' });
@@ -634,6 +991,7 @@ Center the item on a plain light neutral background, soft even studio lighting, 
     if (!hasKey) state.step = 'key';
     if (state.step !== lastStep) { lastStep = state.step; window.scrollTo(0, 0); }
     $('#btn-settings').hidden = !hasKey;
+    refreshCost();
     const stepper = $('#stepper');
     stepper.hidden = state.step === 'key';
     const idx = STEP_OF[state.step] ?? 0;
@@ -725,21 +1083,32 @@ Center the item on a plain light neutral background, soft even studio lighting, 
   }
 
   function viewAnalyzing() {
-    return loadingView('vision', 'Analyse des photos en cours', [
-      'Lecture des photos', "Identification de l'objet et de la marque", 'Repérage des détails et défauts', 'Estimation du prix de revente',
-    ]);
+    const web = webEnabled();
+    return loadingView(state.phase === 'web' ? 'research' : 'vision', web ? 'Analyse et recherche en cours' : 'Analyse des photos en cours', [
+      ['vision', 'Lecture des photos'], ['vision', "Identification de l'objet et de la marque"], ['vision', 'Repérage des détails et défauts'],
+      ...(web ? [['web', 'Recherche de la fiche produit'], ['web', 'Recherche du prix neuf'], ['web', "Relevé des prix d'occasion"]] : []),
+    ], web ? '20 à 60 secondes' : '10 à 30 secondes');
   }
   function viewGenerating() {
     return loadingView('text', "Rédaction de l'annonce", [
-      'Choix des mots-clés recherchés', 'Écriture du titre', 'Rédaction de la description', "Relecture et mise en forme",
-    ]);
+      ['text', 'Choix des mots-clés recherchés'], ['text', 'Écriture du titre'], ['text', 'Rédaction de la description'], ['text', 'Relecture et mise en forme'],
+    ], '10 à 30 secondes');
   }
-  function loadingView(role, title, steps) {
+  // Étapes : [phase, libellé]. Les étapes des phases passées sont cochées.
+  function loadingView(role, title, steps, duration) {
+    const phases = [...new Set(steps.map((x) => x[0]))];
+    const current = phases.includes(state.phase) ? state.phase : phases[0];
+    const ci = phases.indexOf(current);
+    const firstOfCurrent = steps.findIndex((x) => x[0] === current);
     return `<div class="loading card">
       <div class="spinner" aria-hidden="true"></div>
       <h2>${title}</h2>
-      <p class="muted">Environ 10 à 30 secondes avec ${esc(modelLabel(role))}.</p>
-      <ol class="steps" id="loading-steps">${steps.map((s, i) => `<li class="${i === 0 ? 'on' : ''}">${s}</li>`).join('')}</ol>
+      <p class="muted">Environ ${duration} avec ${esc(modelLabel(role))}.</p>
+      <ol class="steps" id="loading-steps">${steps.map(([ph, t], i) => {
+        const cls = phases.indexOf(ph) < ci ? 'ok' : i === firstOfCurrent ? 'on' : '';
+        return `<li class="${cls}" data-phase="${ph}">${t}</li>`;
+      }).join('')}</ol>
+      ${state.ops.length ? `<p class="muted small" style="margin:14px 0 0">Coût jusqu'ici : <strong id="live-cost">${fmtUsd(costTotals().cost)}</strong></p>` : ''}
     </div>`;
   }
   function modelLabel(role) {
@@ -778,11 +1147,55 @@ Center the item on a plain light neutral background, soft even studio lighting, 
           <div class="chips">${a.defauts_visibles.map((c) => `<span class="chip warn">${esc(c)}</span>`).join('')}</div>
           <p class="muted small" style="margin:6px 0 0">Ils seront mentionnés honnêtement : cela évite les négociations au rendez-vous.</p>` : ''}
       </div>
+      ${researchCard()}
       ${a.questions.length ? `<div class="card">
         <h2>Quelques questions</h2>
         ${a.questions.map((q) => questionField(q)).join('')}
       </div>` : ''}
       ${actionbar(`<button class="btn secondary" id="btn-back">Retour</button><button class="btn" id="btn-next">Continuer</button>`)}`;
+  }
+
+  function hostOf(url) {
+    try { return new URL(url).hostname.replace(/^www\./, ''); } catch (e) { return url; }
+  }
+
+  function researchCard() {
+    const r = state.research;
+    const retry = `<button class="btn secondary small" id="btn-research" type="button">${r.status === 'done' ? 'Relancer avec les infos corrigées' : 'Lancer la recherche'}</button>`;
+    if (r.status === 'running') {
+      return `<div class="card"><h2>Recherche sur Internet</h2>
+        <div class="loading" style="padding:10px 0"><div class="spinner" aria-hidden="true"></div>
+        <p class="muted" style="margin:0">Recherche en cours avec ${esc(modelLabel('research'))}...</p></div></div>`;
+    }
+    if (r.status === 'error') {
+      return `<div class="card"><h2>Recherche sur Internet</h2>
+        <div class="info-box">La recherche a échoué : ${esc(r.error)} L'annonce sera rédigée avec les photos seulement.</div>${retry}</div>`;
+    }
+    if (r.status !== 'done') {
+      return webEnabled() ? '' : `<div class="card"><h2>Recherche sur Internet</h2>
+        <p class="muted" style="margin:0 0 10px">Désactivée dans les réglages. Elle trouve la fiche produit, le prix neuf et les prix d'occasion.</p>${retry}</div>`;
+    }
+    const d = r.data;
+    const specs = [
+      d.nom_complet && ['Nom exact', d.nom_complet],
+      d.annee_sortie && ['Sortie', d.annee_sortie],
+      d.prix_neuf.montant && ['Prix neuf', `${d.prix_neuf.montant} €${d.prix_neuf.precision ? ` (${d.prix_neuf.precision})` : ''}`],
+      d.prix_occasion.max && ['Occasion', `${d.prix_occasion.min} à ${d.prix_occasion.max} €${d.prix_occasion.commentaire ? `, ${d.prix_occasion.commentaire}` : ''}`],
+    ].filter(Boolean);
+    const chips = (title, list, cls = '') => list.length
+      ? `<p style="font-weight:600;margin:14px 0 8px">${title}</p><div class="chips">${list.map((c) => `<span class="chip ${cls}">${esc(c)}</span>`).join('')}</div>` : '';
+    return `<div class="card">
+      <h2>Trouvé sur Internet <span class="chip ok confidence">${r.sources.length} source${r.sources.length > 1 ? 's' : ''}</span></h2>
+      ${d.identification_confirmee ? '' : `<div class="info-box">Identification à vérifier : ${esc(d.remarque_identification || "les résultats ne correspondent pas clairement à l'objet.")} Corrigez marque ou modèle ci-dessus puis relancez.</div>`}
+      ${specs.length ? `<dl class="specs">${specs.map(([k, v]) => `<dt>${k}</dt><dd>${esc(v)}</dd>`).join('')}</dl>` : ''}
+      ${chips('Caractéristiques officielles', d.caracteristiques_officielles)}
+      ${chips("Dans la boîte d'origine", d.contenu_boite_origine)}
+      ${chips('Qualités reconnues', d.qualites_reconnues, 'ok')}
+      ${chips('Mots tapés par les acheteurs', d.mots_cles_acheteurs, 'orange')}
+      ${r.sources.length ? `<details style="margin-top:14px"><summary style="cursor:pointer;font-weight:600">Sources consultées</summary>
+        <ul style="margin:8px 0 0;padding-left:18px;font-size:14px">${r.sources.map((x) => `<li><a href="${esc(x.url)}" target="_blank" rel="noopener">${esc(x.titre || hostOf(x.url))}</a> <span class="muted">${esc(hostOf(x.url))}</span></li>`).join('')}</ul></details>` : ''}
+      <div style="margin-top:14px">${retry}</div>
+    </div>`;
   }
 
   function questionField(q) {
@@ -806,7 +1219,8 @@ Center the item on a plain light neutral background, soft even studio lighting, 
   function viewDetails() {
     const d = state.details;
     const a = state.analysis || { fourchette_prix: {} };
-    const fp = a.fourchette_prix || {};
+    const fp = priceBand();
+    const neuf = state.research.data?.prix_neuf.montant || a.prix_neuf_estime;
     const suggestions = fp.max > 0 ? [fp.min, Math.round((fp.min + fp.max) / 2), fp.max].filter((v, i, arr) => v > 0 && arr.indexOf(v) === i) : [];
     return `
       <h1>État, prix et remise</h1>
@@ -826,7 +1240,7 @@ Center the item on a plain light neutral background, soft even studio lighting, 
         <label class="field" style="margin-bottom:${suggestions.length ? '10px' : '0'}">
           <span class="label">Prix de vente</span>
           <div class="price-wrap"><input class="input price-input" id="prix" type="text" inputmode="decimal" value="${esc(d.prix)}" placeholder="0"></div>
-          ${fp.max > 0 ? `<span class="hint">Prix constaté en occasion : ${fp.min} à ${fp.max} €${a.prix_neuf_estime ? `, neuf environ ${a.prix_neuf_estime} €` : ''}.</span>` : '<span class="hint">Laissez vide pour obtenir un prix conseillé.</span>'}
+          ${fp.max > 0 ? `<span class="hint">${fp.web ? "Prix d'occasion relevés en ligne" : "Prix d'occasion estimé d'après les photos"} : ${fp.min} à ${fp.max} €${neuf ? `, neuf ${fp.web && state.research.data?.prix_neuf.montant ? '' : 'environ '}${neuf} €` : ''}.</span>` : '<span class="hint">Laissez vide pour obtenir un prix conseillé.</span>'}
         </label>
         ${suggestions.length ? `<div class="chips">${suggestions.map((v) => `<button type="button" class="chip orange" data-price="${v}" style="border:0;cursor:pointer;min-height:36px">${v} €</button>`).join('')}</div>` : ''}
       </div>
@@ -867,6 +1281,7 @@ Center the item on a plain light neutral background, soft even studio lighting, 
           ${ad.categorie ? `<span class="chip">${esc(ad.categorie)}</span>` : ''}
           ${d.mainPropre ? `<span class="chip ok">Main propre${d.ville.trim() ? ' à ' + esc(d.ville.trim()) : ''}</span>` : ''}
           ${d.envoi ? '<span class="chip ok">Envoi possible</span>' : ''}
+          ${state.research.data?.prix_neuf.montant ? `<span class="chip">Prix neuf ${state.research.data.prix_neuf.montant} €</span>` : ''}
         </div>
         ${ad.accroche ? `<p style="margin:0;font-weight:600">${esc(ad.accroche)}</p>` : ''}
         ${ad.points_forts.length ? `<section class="ad-section"><h3>Points forts</h3>
@@ -914,6 +1329,9 @@ Center the item on a plain light neutral background, soft even studio lighting, 
         <button role="tab" id="tab-apercu" aria-selected="${state.tab === 'apercu'}">Aperçu</button>
         <button role="tab" id="tab-texte" aria-selected="${state.tab === 'texte'}">Modifier et copier</button>
       </div>
+      ${state.enhance.busy ? `<div class="info-box" style="display:flex;gap:12px;align-items:center"><div class="spinner" style="width:22px;height:22px;border-width:3px;margin:0;flex:none"></div>
+        <span>Création de la photo de couverture avec ${esc(modelLabel('image'))}, 20 à 60 secondes. Elle apparaîtra en première position.</span></div>` : ''}
+      ${state.enhance.error ? `<div class="error-box" role="alert">${esc(state.enhance.error)} <button class="btn small secondary" id="btn-enhance-top" style="margin-top:8px">Réessayer</button></div>` : ''}
       <div id="panel-apercu" ${state.tab === 'apercu' ? '' : 'hidden'}>${adPreviewHtml(state.photos.map((p) => p.url))}</div>
       <div id="panel-texte" ${state.tab === 'texte' ? '' : 'hidden'}>
         <div class="card">
@@ -932,6 +1350,10 @@ Center the item on a plain light neutral background, soft even studio lighting, 
         </div>
       </div>
       <div style="margin-top:14px">${enhanceCard()}</div>
+      <div class="card">
+        <h2>Ce qu'a coûté cette annonce</h2>
+        <div id="cost-card-body">${costDetailHtml()}</div>
+      </div>
       <div class="card">
         <h2>Récupérer l'annonce</h2>
         <div class="export-grid">
@@ -1028,6 +1450,8 @@ Center the item on a plain light neutral background, soft even studio lighting, 
       });
       $('#btn-back').onclick = () => { state.error = ''; state.step = 'photos'; render(); };
       $('#btn-next').onclick = () => { state.error = ''; state.step = 'details'; render(); window.scrollTo(0, 0); };
+      const rb = $('#btn-research');
+      if (rb) rb.onclick = async () => { state.research.status = 'running'; render(); await runResearch(); suggestPrice(); render(); };
     },
 
     details() {
@@ -1074,10 +1498,10 @@ Center the item on a plain light neutral background, soft even studio lighting, 
       $('#btn-new').onclick = () => openConfirmNew();
       const on = (id, fn) => { const el = $(id); if (el) el.onclick = fn; };
       on('#btn-enhance-retry', () => runEnhance());
+      on('#btn-enhance-top', () => runEnhance(true));
       on('#btn-enhance-drop', () => { state.enhance = { busy: false, url: '', error: '' }; render(); });
       on('#btn-enhance-use', () => {
-        state.photos = state.photos.filter((p) => !p.generated);
-        state.photos.unshift({ id: uid(), url: state.enhance.url, apiData: '', generated: true });
+        useAsCover(state.enhance.url);
         state.enhance = { busy: false, url: '', error: '' };
         state.tab = 'apercu';
         render();
@@ -1089,16 +1513,17 @@ Center the item on a plain light neutral background, soft even studio lighting, 
   };
 
   let stepTimer;
+  // Avance l'étape affichée, sans jamais dépasser la dernière étape de la phase en cours.
   function animateSteps() {
     clearInterval(stepTimer);
-    let i = 0;
     stepTimer = setInterval(() => {
       const items = $$('#loading-steps li');
       if (!items.length) { clearInterval(stepTimer); return; }
-      if (i < items.length - 1) {
+      const i = items.findIndex((li) => li.className === 'on');
+      const next = items[i + 1];
+      if (i >= 0 && next && next.dataset.phase === items[i].dataset.phase) {
         items[i].className = 'ok';
-        i += 1;
-        items[i].className = 'on';
+        next.className = 'on';
       }
     }, 3500);
   }
@@ -1130,7 +1555,7 @@ Center the item on a plain light neutral background, soft even studio lighting, 
       </select>
       <input class="input" style="margin-top:8px" id="custom-${role}" ${custom ? '' : 'hidden'} value="${custom ? esc(current) : ''}"
         placeholder="fournisseur/modele" autocapitalize="off" spellcheck="false" aria-label="Identifiant du modèle">
-      <span class="hint">${r.hint}</span>
+      <span class="hint">${r.hint} <span data-price-for="${role}"></span></span>
     </div>`;
   }
 
@@ -1146,17 +1571,32 @@ Center the item on a plain light neutral background, soft even studio lighting, 
         <span class="hint">Enregistrée dans ce navigateur, sans expiration.</span>
       </div>
       <button class="btn danger block" id="btn-forget" style="margin-bottom:20px">Changer de clé</button>
+      <label class="toggle"><span class="txt"><strong>Recherche sur Internet</strong><small>Après l'analyse des photos : fiche produit, prix neuf, prix d'occasion</small></span>
+        <input type="checkbox" id="web-toggle" ${webEnabled() ? 'checked' : ''}><span class="sw" aria-hidden="true"></span></label>
+      <label class="toggle"><span class="txt"><strong>Photo de couverture automatique</strong><small>Crée une photo studio de l'objet pendant la rédaction et la met en première position</small></span>
+        <input type="checkbox" id="cover-toggle" ${autoCover() ? 'checked' : ''}><span class="sw" aria-hidden="true"></span></label>
       ${Object.keys(ROLES).map(modelField).join('')}
       <button class="btn secondary block" id="btn-reset-models" style="margin-bottom:10px">Modèles par défaut</button>
       <button class="btn block" id="btn-close-settings">Fermer</button>`, (s) => {
+      $('#cover-toggle', s).onchange = (e) => { store.set(STORAGE_COVER, e.target.checked ? 'on' : 'off'); };
+      $('#web-toggle', s).onchange = (e) => { store.set(STORAGE_WEB, e.target.checked ? 'on' : 'off'); render(); };
+      const showPrice = async (role) => {
+        const el = $(`[data-price-for="${role}"]`, s);
+        const pr = await priceRange(model(role));
+        if (!el) return;
+        el.textContent = !pr ? '' : pr.imageOutput
+          ? `Prix : ${fmtPerM(pr.imageOutput)} par million de jetons d'image.`
+          : `Prix : ${fmtPerM(pr.prompt)} en entrée, ${fmtPerM(pr.completion)} en sortie, par million de jetons.`;
+      };
       Object.keys(ROLES).forEach((role) => {
+        showPrice(role);
         const sel = $(`#model-${role}`, s);
         const input = $(`#custom-${role}`, s);
         sel.onchange = () => {
           input.hidden = sel.value !== '__custom';
-          if (sel.value !== '__custom') { store.set(ROLES[role].storage, sel.value); toast('Modèle enregistré'); } else input.focus();
+          if (sel.value !== '__custom') { store.set(ROLES[role].storage, sel.value); toast('Modèle enregistré'); showPrice(role); } else input.focus();
         };
-        input.onchange = () => { if (input.value.trim()) { store.set(ROLES[role].storage, input.value.trim()); toast('Modèle enregistré'); } };
+        input.onchange = () => { if (input.value.trim()) { store.set(ROLES[role].storage, input.value.trim()); toast('Modèle enregistré'); showPrice(role); } };
       });
       $('#btn-reset-models', s).onclick = () => {
         Object.values(ROLES).forEach((r) => store.del(r.storage));
@@ -1172,6 +1612,7 @@ Center the item on a plain light neutral background, soft even studio lighting, 
     });
   }
   $('#btn-settings').onclick = openSettings;
+  $('#btn-cost').onclick = openCostSheet;
 
   function openConfirmNew() {
     openSheet(`
