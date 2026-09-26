@@ -23,7 +23,7 @@ jobs:
         with:
           node-version: 22
       - run: node --check js/app.js
-      - run: node --test tests/
+      - run: node --test tests/*.test.js
 
   deploy:
     needs: test

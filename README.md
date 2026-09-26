@@ -30,7 +30,7 @@ Aucune étape de build : HTML, CSS et JavaScript servis tels quels.
 
 ```sh
 python3 -m http.server 8000   # puis http://localhost:8000
-node --test tests/            # tests du filtre anti-marques d'IA
+node --test tests/*.test.js   # tests du filtre anti-marques d'IA
 ```
 
 Chaque push sur `main` lance les tests puis déploie sur GitHub Pages (`.github/workflows/pages.yml`).
