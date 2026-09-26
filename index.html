@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#ec5a13">
+  <meta name="description" content="Créez une annonce Leboncoin prête à publier à partir de vos photos : titre, description, prix conseillé, photos optimisées.">
+  <title>Assistant annonce Leboncoin</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icon.svg">
+  <link rel="stylesheet" href="css/app.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js" defer></script>
+  <script src="js/humanize.js" defer></script>
+  <script src="js/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <img src="icon.svg" alt="" width="28" height="28">
+      <span>Assistant annonce</span>
+    </div>
+    <button class="icon-btn" id="btn-settings" type="button" aria-label="Réglages" hidden>
+      <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M19.4 13a7.7 7.7 0 0 0 0-2l2.1-1.6-2-3.5-2.5 1a7.3 7.3 0 0 0-1.7-1L14.9 3h-4l-.4 2.9a7.3 7.3 0 0 0-1.7 1l-2.5-1-2 3.5L6.4 11a7.7 7.7 0 0 0 0 2l-2.1 1.6 2 3.5 2.5-1a7.3 7.3 0 0 0 1.7 1l.4 2.9h4l.4-2.9a7.3 7.3 0 0 0 1.7-1l2.5 1 2-3.5zM12.9 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7z"/></svg>
+    </button>
+  </header>
+
+  <nav class="stepper" id="stepper" hidden aria-label="Étapes">
+    <ol>
+      <li data-step="photos"><span>1</span>Photos</li>
+      <li data-step="questions"><span>2</span>Questions</li>
+      <li data-step="details"><span>3</span>Détails</li>
+      <li data-step="annonce"><span>4</span>Annonce</li>
+    </ol>
+  </nav>
+
+  <main id="app" class="app"></main>
+
+  <div class="sheet-backdrop" id="sheet-backdrop" hidden></div>
+  <section class="sheet" id="sheet" hidden role="dialog" aria-modal="true" aria-labelledby="sheet-title"></section>
+
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+</body>
+</html>
