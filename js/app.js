@@ -310,8 +310,10 @@
     recordOp(label, id, data, performance.now() - t0);
     // Réponse toujours en base64 (pas d'URL) selon la doc de l'endpoint.
     const item = data.data?.[0] || {};
-    if (!item.b64_json) throw new ApiError("Le modèle n'a pas renvoyé d'image. Réessayez ou changez de modèle d'image dans les réglages.");
-    return `data:${item.media_type || 'image/png'};base64,${item.b64_json}`;
+    // Valeurs filtrées : l'URL finit dans du HTML (attribut src).
+    if (!/^[A-Za-z0-9+/=]+$/.test(item.b64_json || '')) throw new ApiError("Le modèle n'a pas renvoyé d'image. Réessayez ou changez de modèle d'image dans les réglages.");
+    const type = /^image\/(png|jpeg|webp)$/.test(item.media_type || '') ? item.media_type : 'image/png';
+    return `data:${type};base64,${item.b64_json}`;
   }
 
   // ---------- Coûts ----------
