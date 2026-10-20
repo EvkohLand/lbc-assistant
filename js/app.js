@@ -799,7 +799,7 @@ Réponds uniquement avec un objet JSON de cette forme :
   // face never visible (frame starts at the chin at most).
   const ENHANCE_PROMPT = (objet) => `Turn this photo into a simple, natural cover photo for a second-hand listing${objet ? ` (the item is: ${objet})` : ''}.
 Keep the exact same item: same shape, proportions, colors, brand markings, and any visible wear, scratches or defects. Do not add, remove or modify any part of the item, and do not invent parts that are not visible in the photo.
-If the item is clothing, shoes or an accessory that is worn, show it worn by a person standing in front of a plain white wall. Frame the shot so the face is never visible: the top of the image stops at the chin or lower. No other identifiable features, no tattoos, no jewelry that is not part of the item.
+If the item is clothing, shoes or an accessory that is worn, show it worn by a person standing in front of a plain white wall. Frame the shot so the face is never visible: the top of the image stops at the chin or lower. The person's neck and chest fill the collar opening: the inside of the garment (back lining, inner labels) must never be visible through the neckline, exactly as with a real garment worn by a real body. No other identifiable features, no tattoos, no jewelry that is not part of the item.
 Otherwise, show the item on its own in front of a plain white wall, on a simple surface.
 The wall is an ordinary painted white wall, slightly off-white with soft natural variations, not a pure white studio backdrop.
 It must look like an ordinary, well-taken smartphone photo in daylight: natural soft light from a window, a real soft shadow, true colors, no retouching, no glossy studio look, no artificial perfection, no AI look.
