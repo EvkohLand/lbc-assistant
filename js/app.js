@@ -257,90 +257,61 @@
     return parseJson(messageText(data));
   }
 
-  // Recherche via le plugin web OpenRouter, avec JSON explicitement demandé.
+  // Recherche web exécutée par OpenRouter pendant l'appel : le modèle décide des requêtes.
+  // Constaté le 20/10/2026 : avec 5 à 7 recherches, DeepSeek dépasse 3500 jetons
+  // (réflexion comprise) et le JSON arrive tronqué ; 8000 laisse de la marge.
   async function webResearch(label, messages) {
     const body = {
-      model: model('research'), messages: [
-        ...messages,
-        { role: 'user', content: 'Effectue une recherche Internet et retourne uniquement un objet JSON valide correspondant au format demandé, avec les URL des sources consultées.' },
-      ],
-      temperature: 0.2, max_tokens: 3500,
-      plugins: [{ id: 'web', max_results: 8 }],
+      model: model('research'), messages, temperature: 0.2, max_tokens: 8000,
+      tools: [{ type: 'openrouter:web_search', parameters: { max_results: 5, max_total_results: 15 } }],
     };
-    const data = await request(label, body);
+    // Outil serveur refusé pour ce modèle : ancienne méthode, une recherche unique.
+    const data = await request(label, body, (b, txt) => {
+      if (!/tool|web_search|plugin/i.test(txt)) return null;
+      const { tools, ...rest } = b;
+      return { ...rest, plugins: [{ id: 'web', max_results: 8 }] };
+    });
+    if (data.choices?.[0]?.finish_reason === 'length') {
+      throw new ApiError("La réponse de la recherche a été coupée avant la fin. Réessayez ou changez de modèle dans les réglages.");
+    }
     const msg = data.choices?.[0]?.message || {};
     const cited = (msg.annotations || []).filter((a) => a.type === 'url_citation')
       .map((a) => ({ titre: a.url_citation?.title || '', url: a.url_citation?.url || '' }));
     return { json: parseJson(messageText(data)), cited };
   }
 
-  // Le modèle GPT Image utilise l'endpoint images, pas chat/completions.
+  // Produit une image à partir d'une photo et d'une consigne. Renvoie une URL data:.
+  // Les modèles d'image passent par l'endpoint unifié /images (JSON, photo dans
+  // input_references) : chat/completions renvoie 404 pour GPT Image, et /images/edits
+  // n'existe pas chez OpenRouter. Testé le 20/10/2026 avec GPT Image 2.5 et Nano Banana 2.
   async function generateImage(label, photoData, prompt) {
     const id = model('image');
-    if (id === 'openai/gpt-image-2.5-sunburst') {
-      const t0 = performance.now();
-      const blob = await (await fetch(photoData)).blob();
-      const form = new FormData();
-      form.append('model', id);
-      form.append('prompt', prompt);
-      form.append('image', blob, 'photo.jpg');
-      form.append('size', '1024x1024');
-      let data;
-      try {
-        const res = await fetch(`${OPENROUTER}/images/edits`, {
-          method: 'POST',
-          headers: { Authorization: `Bearer ${apiKey()}`, 'HTTP-Referer': location.origin + location.pathname, 'X-Title': 'Assistant annonce Leboncoin' },
-          body: form,
-        });
-        data = await readResponse(res);
-      } catch (e) {
-        recordOp(label, id, null, performance.now() - t0, e.message);
-        throw e;
-      }
-      recordOp(label, id, data, performance.now() - t0);
-      const item = data.data?.[0] || {};
-      const url = item.b64_json ? 'data:image/png;base64,' + item.b64_json : item.url;
-      if (!url) throw new ApiError("Le modèle n'a pas renvoyé d'image. Vérifiez le modèle dans les réglages.");
-      return toLocalImage(url);
-    }
-    const body = {
-      model: id, modalities: ['image'],
-      messages: [{ role: 'user', content: [{ type: 'text', text: prompt }, { type: 'image_url', image_url: { url: photoData } }] }],
-      image_config: { aspect_ratio: '4:3' },
-    };
-    const data = await request(label, body, (b) => { const { image_config, ...rest } = b; return rest; });
-    const url = extractImage(data.choices?.[0]?.message || {});
-    if (!url) throw new ApiError("Le modèle n'a pas renvoyé d'image. Réessayez ou changez de modèle.");
-    return toLocalImage(url);
-  }
-
-  // L'image peut arriver sous plusieurs formes selon le fournisseur.
-  function extractImage(msg) {
-    const found = [];
-    const b64 = (x) => (x ? 'data:image/png;base64,' + x : null);
-    for (const im of msg.images || []) {
-      found.push(typeof im === 'string' ? im : null, im?.image_url?.url, typeof im?.image_url === 'string' ? im.image_url : null, im?.url, b64(im?.b64_json));
-    }
-    if (Array.isArray(msg.content)) {
-      for (const c of msg.content) {
-        found.push(c?.image_url?.url, typeof c?.image_url === 'string' ? c.image_url : null, c?.url, b64(c?.b64_json), b64(c?.image_base64), b64(c?.result));
-      }
-    } else if (typeof msg.content === 'string') {
-      found.push(msg.content.match(/data:image\/[a-z+]+;base64,[A-Za-z0-9+/=]+/)?.[0]);
-      found.push(msg.content.match(/https?:\/\/[^\s)"']+\.(?:png|jpe?g|webp)(?:\?[^\s)"']*)?/i)?.[0]);
-    }
-    return found.find((x) => typeof x === 'string' && /^(data:image\/|https?:\/\/)/.test(x)) || '';
-  }
-
-  // Une image distante est rapatriée pour pouvoir être réencodée dans le ZIP.
-  async function toLocalImage(url) {
-    if (url.startsWith('data:')) return url;
+    const t0 = performance.now();
+    let data;
     try {
-      const blob = await (await fetch(url)).blob();
-      return URL.createObjectURL(blob);
+      const res = await fetch(`${OPENROUTER}/images`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey()}`,
+          'Content-Type': 'application/json',
+          'HTTP-Referer': location.origin + location.pathname,
+          'X-Title': 'Assistant annonce Leboncoin',
+        },
+        body: JSON.stringify({
+          model: id, prompt, aspect_ratio: '4:3',
+          input_references: [{ type: 'image_url', image_url: { url: photoData } }],
+        }),
+      });
+      data = await readResponse(res);
     } catch (e) {
-      return url;
+      recordOp(label, id, null, performance.now() - t0, e.message);
+      throw e;
     }
+    recordOp(label, id, data, performance.now() - t0);
+    // Réponse toujours en base64 (pas d'URL) selon la doc de l'endpoint.
+    const item = data.data?.[0] || {};
+    if (!item.b64_json) throw new ApiError("Le modèle n'a pas renvoyé d'image. Réessayez ou changez de modèle d'image dans les réglages.");
+    return `data:${item.media_type || 'image/png'};base64,${item.b64_json}`;
   }
 
   // ---------- Coûts ----------
