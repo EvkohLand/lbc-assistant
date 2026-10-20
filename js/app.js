@@ -257,42 +257,60 @@
     return parseJson(messageText(data));
   }
 
-  // Recherche web exécutée par OpenRouter pendant l'appel : le modèle décide des requêtes.
+  // Recherche via le plugin web OpenRouter, avec JSON explicitement demandé.
   async function webResearch(label, messages) {
     const body = {
-      model: model('research'), messages, temperature: 0.2, max_tokens: 3500,
-      tools: [{ type: 'openrouter:web_search', parameters: { max_results: 5, max_total_results: 15 } }],
+      model: model('research'), messages: [
+        ...messages,
+        { role: 'user', content: 'Effectue une recherche Internet et retourne uniquement un objet JSON valide correspondant au format demandé, avec les URL des sources consultées.' },
+      ],
+      temperature: 0.2, max_tokens: 3500,
+      plugins: [{ id: 'web', max_results: 8 }],
     };
-    // Outil serveur refusé pour ce modèle : ancienne méthode, une recherche unique.
-    const data = await request(label, body, (b, txt) => {
-      if (!/tool|web_search|plugin/i.test(txt)) return null;
-      const { tools, ...rest } = b;
-      return { ...rest, plugins: [{ id: 'web', max_results: 8 }] };
-    });
+    const data = await request(label, body);
     const msg = data.choices?.[0]?.message || {};
     const cited = (msg.annotations || []).filter((a) => a.type === 'url_citation')
       .map((a) => ({ titre: a.url_citation?.title || '', url: a.url_citation?.url || '' }));
     return { json: parseJson(messageText(data)), cited };
   }
 
-  // Produit une image à partir d'une photo et d'une consigne. Renvoie une URL data:.
+  // Le modèle GPT Image utilise l'endpoint images, pas chat/completions.
   async function generateImage(label, photoData, prompt) {
+    const id = model('image');
+    if (id === 'openai/gpt-image-2.5-sunburst') {
+      const t0 = performance.now();
+      const blob = await (await fetch(photoData)).blob();
+      const form = new FormData();
+      form.append('model', id);
+      form.append('prompt', prompt);
+      form.append('image', blob, 'photo.jpg');
+      form.append('size', '1024x1024');
+      let data;
+      try {
+        const res = await fetch(`${OPENROUTER}/images/edits`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${apiKey()}`, 'HTTP-Referer': location.origin + location.pathname, 'X-Title': 'Assistant annonce Leboncoin' },
+          body: form,
+        });
+        data = await readResponse(res);
+      } catch (e) {
+        recordOp(label, id, null, performance.now() - t0, e.message);
+        throw e;
+      }
+      recordOp(label, id, data, performance.now() - t0);
+      const item = data.data?.[0] || {};
+      const url = item.b64_json ? 'data:image/png;base64,' + item.b64_json : item.url;
+      if (!url) throw new ApiError("Le modèle n'a pas renvoyé d'image. Vérifiez le modèle dans les réglages.");
+      return toLocalImage(url);
+    }
     const body = {
-      model: model('image'),
-      modalities: ['image'],
+      model: id, modalities: ['image'],
       messages: [{ role: 'user', content: [{ type: 'text', text: prompt }, { type: 'image_url', image_url: { url: photoData } }] }],
       image_config: { aspect_ratio: '4:3' },
     };
-    const data = await request(label, body,
-      // Réglage d'image refusé : valeurs par défaut du modèle.
-      (b) => { const { image_config, ...rest } = b; return rest; },
-      // Sortie image seule refusée : image et texte.
-      (b) => ({ ...b, modalities: ['image', 'text'] }));
+    const data = await request(label, body, (b) => { const { image_config, ...rest } = b; return rest; });
     const url = extractImage(data.choices?.[0]?.message || {});
-    if (!url) {
-      const text = messageText(data).slice(0, 160);
-      throw new ApiError(`Le modèle n'a pas renvoyé d'image${text ? ' (réponse : « ' + text + ' »)' : ''}. Réessayez ou changez de modèle d'image dans les réglages.`);
-    }
+    if (!url) throw new ApiError("Le modèle n'a pas renvoyé d'image. Réessayez ou changez de modèle.");
     return toLocalImage(url);
   }
 
